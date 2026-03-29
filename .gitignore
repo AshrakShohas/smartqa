@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment variables (contains API key!)
+.env
+env
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Document files (too large for git)
+*.pdf
+*.docx
+*.pptx
+*.ppt
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+
+# Temporary files
+*.log
+*.tmp
+*.temp
+
+# Streamlit
+.streamlit/secrets.toml
