@@ -5,7 +5,7 @@ __pycache__/
 *.pyd
 
 # Environment variables (contains API key!)
-
+.env
 env
 venv/
 ENV/
