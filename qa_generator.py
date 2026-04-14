@@ -1,40 +1,67 @@
 """
 qa_generator.py
-Each question now returns extra "find it" fields:
-  - section_name   : e.g. "Chapter 3: Gibbs Energy"
-  - search_keyword : a short keyword Onna can Ctrl+F in her file
-  - where_to_find  : human-readable hint e.g. "Page 12, under Entropy"
+Strategy: Gemini first → Groq fallback (no race, sequential).
+Speed:     Generates in small batches of BATCH_SIZE questions,
+           calling on_batch() after each so UI shows results progressively.
 """
 
 import json
 import re
 import time
 import random
-import concurrent.futures
-from google import genai
-from google.genai import types
+
+# ── Gemini ────────────────────────────────────────────────────
+try:
+    from google import genai
+    from google.genai import types as genai_types
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    print("  ⚠️ google-genai not installed — run: pip install google-genai")
+
+# ── Groq ──────────────────────────────────────────────────────
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+    print("  ⚠️ groq not installed — run: pip install groq")
 
 
-AVAILABLE_MODELS = [
+GEMINI_MODELS = [
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
     "gemini-2.5-flash",
     "gemini-flash-latest",
-    "gemini-2.5-flash-lite",
 ]
 
-MAX_CHARS_PER_CHUNK = 30000
-MAX_PARALLEL_CHUNKS = 3
+# Confirmed available April 2026 (from live model list)
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",          # Best quality, large context
+    "openai/gpt-oss-120b",              # Very strong, large
+    "moonshotai/kimi-k2-instruct",      # Strong alternative
+    "qwen/qwen3-32b",                   # Good quality
+    "meta-llama/llama-4-scout-17b-16e-instruct",  # Fast
+    "openai/gpt-oss-20b",              # Lighter fallback
+    "llama-3.1-8b-instant",            # Fastest, last resort
+]
+
+BATCH_SIZE      = 10     # questions per API call — first 10 show up fast, then next 10, etc.
+MAX_CHARS_BATCH = 25000  # max content chars per prompt
 
 QTYPE_INSTRUCTIONS = {
-    "definition":  "Generate ONLY definition-type questions: 'What is...?', 'Define...', 'What do you mean by...?'. Focus on terms and their meanings.",
-    "descriptive": "Generate ONLY descriptive questions: 'Explain...', 'Describe...', 'Discuss...', 'How does...?'. Answers must be detailed paragraphs.",
-    "formula":     "Generate ONLY questions involving mathematical formulas, chemical equations, bonds, or numerical expressions. Every answer must include a formula.",
-    "figure":      "Generate ONLY questions about diagrams, figures, graphs, or structural content: 'Draw and explain...', 'What does the diagram show?', 'Sketch and label...'",
-    "smart":       "Pick the most important questions covering key concepts, frequently tested ideas, and foundational principles.",
-    "mixed":       "Generate a balanced mix of definition, descriptive, and formula-based questions.",
+    "definition":  "Generate ONLY definition questions: 'What is...?', 'Define...'. Focus on terms.",
+    "descriptive": "Generate ONLY descriptive questions: 'Explain...', 'Describe...', 'Discuss...'.",
+    "formula":     "Generate ONLY formula/equation questions. Every answer must include a formula.",
+    "figure":      "Generate ONLY diagram/figure questions: 'Draw and explain...', 'What does the figure show?'",
+    "smart":       "Pick the MOST IMPORTANT questions covering key concepts and frequently tested ideas.",
+    "mixed":       "Generate a balanced mix: definitions, descriptive, and formula questions.",
 }
 
+
+# ══════════════════════════════════════════════════════════════
+# PUBLIC ENTRY POINT
+# ══════════════════════════════════════════════════════════════
 
 def generate_questions(
     text, filename, api_key,
@@ -43,294 +70,429 @@ def generate_questions(
     metadata=None,
     smart_mode=False, smart_total=50,
     question_type="mixed", wants_summary=False,
+    groq_api_key=None,
+    race_mode=False,   # kept for API compat
+    api_mode="auto",   # "auto"=Gemini first→Groq fallback | "gemini"=Gemini only | "groq"=Groq only | "race"=parallel fastest wins
+    on_batch=None,     # callback(batch_questions, summary_or_None) for progressive UI
 ):
-    meta_ctx       = _build_meta_context(metadata)
-    pages_in_range = max(1, page_to - page_from + 1)
-    qtype_instr    = QTYPE_INSTRUCTIONS.get(question_type, QTYPE_INSTRUCTIONS["mixed"])
+    meta_ctx    = _build_meta_context(metadata)
+    qtype_instr = QTYPE_INSTRUCTIONS.get(question_type, QTYPE_INSTRUCTIONS["mixed"])
+    content     = text[:MAX_CHARS_BATCH]
 
-    # ── Smart mode ───────────────────────────────────────────────
     if smart_mode:
-        prompt = _build_smart_prompt(
-            content=text[:MAX_CHARS_PER_CHUNK * 2],
-            filename=filename, difficulties=difficulties, lengths=lengths,
-            total_q=smart_total, lang=lang, meta_ctx=meta_ctx,
-            qtype_instr=qtype_instr, wants_summary=wants_summary,
+        total_needed = smart_total
+    else:
+        pages  = max(1, page_to - page_from + 1)
+        n_diff = max(1, len(difficulties))
+        total_needed = min(pages * q_per_page * n_diff, 120)
+
+    all_questions    = []
+    generated        = 0
+    batch_num        = 0
+
+    while generated < total_needed:
+        this_batch = min(BATCH_SIZE, total_needed - generated)
+        batch_num += 1
+        id_start   = generated + 1
+
+        # Build two versions of the prompt - Groq needs simpler schema
+        prompt_gemini = _build_batch_prompt(
+            content=content, filename=filename, difficulties=difficulties,
+            lengths=lengths, qtype_instr=qtype_instr, lang=lang, meta_ctx=meta_ctx,
+            batch_size=this_batch, id_start=id_start, page_from=page_from,
+            page_to=page_to, wants_summary=(wants_summary and batch_num == 1),
+            already_asked=[q.get("question_en", "") for q in all_questions],
+            for_groq=False,
         )
-        questions = _call_api(api_key, prompt, filename, 0, 1)
-        for q in questions:
+        prompt_groq = _build_batch_prompt(
+            content=content, filename=filename, difficulties=difficulties,
+            lengths=lengths, qtype_instr=qtype_instr, lang=lang, meta_ctx=meta_ctx,
+            batch_size=this_batch, id_start=id_start, page_from=page_from,
+            page_to=page_to, wants_summary=(wants_summary and batch_num == 1),
+            already_asked=[q.get("question_en", "") for q in all_questions],
+            for_groq=True,
+        )
+
+        print(f"  📦 Batch {batch_num}: asking for {this_batch} questions (IDs {id_start}–{id_start+this_batch-1})")
+
+        try:
+            batch_qs, summary = _call_api(api_key, groq_api_key, prompt_gemini, prompt_groq, api_mode=api_mode)
+        except Exception as e:
+            print(f"  ❌ Batch {batch_num} failed: {e}")
+            break  # return whatever we have so far
+
+        for q in batch_qs:
             q["source_file"] = filename
-        return questions
 
-    # ── Single chunk ─────────────────────────────────────────────
-    if len(text) <= MAX_CHARS_PER_CHUNK:
-        target_q = max(len(difficulties),
-                       min(pages_in_range * q_per_page * len(difficulties), 80))
-        prompt = _build_prompt(
-            content=text, filename=filename,
-            difficulties=difficulties, lengths=lengths,
-            target_q=target_q, q_per_page=q_per_page,
-            page_start=page_from, page_end=page_to,
-            lang=lang, meta_ctx=meta_ctx,
-            qtype_instr=qtype_instr,
-            wants_summary=wants_summary,
-        )
-        questions = _call_api(api_key, prompt, filename, 0, 1)
-        for q in questions: q["source_file"] = filename
-        return questions
+        all_questions.extend(batch_qs)
+        generated += len(batch_qs)
 
-    # ── Multiple chunks (parallel) ───────────────────────────────
-    chunks = _split_text(text)
-    print(f"  📄 {filename}: {len(chunks)} chunks")
+        if on_batch and batch_qs:
+            on_batch(batch_qs, summary if batch_num == 1 else None)
 
-    chunk_args = []
-    for ci, chunk in enumerate(chunks):
-        ppc  = max(1, pages_in_range // len(chunks))
-        ps   = page_from + ci * ppc
-        pe   = min(page_to, ps + ppc - 1)
-        tq   = max(len(difficulties), min(ppc * q_per_page * len(difficulties), 60))
-        prompt = _build_prompt(
-            content=chunk, filename=filename,
-            difficulties=difficulties, lengths=lengths,
-            target_q=tq, q_per_page=q_per_page,
-            page_start=ps, page_end=pe,
-            lang=lang, meta_ctx=meta_ctx,
-            qtype_instr=qtype_instr,
-            wants_summary=(wants_summary and ci == 0),
-        )
-        chunk_args.append((api_key, prompt, filename, ci, len(chunks), ps, pe))
+        print(f"  ✅ Batch {batch_num} → {len(batch_qs)} questions | Running total: {generated}/{total_needed}")
 
-    all_questions = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PARALLEL_CHUNKS) as ex:
-        futures = {ex.submit(_call_api, a[0],a[1],a[2],a[3],a[4]): a for a in chunk_args}
-        for fut in concurrent.futures.as_completed(futures):
-            a = futures[fut]
-            ps, pe = a[5], a[6]
-            try:
-                qs = fut.result()
-                for q in qs:
-                    q["source_file"] = filename
-                    if len(chunks) > 1:
-                        q.setdefault("topic","")
-                        tag = f" [p.{ps}–{pe}]"
-                        if tag not in q["topic"]:
-                            q["topic"] = (q["topic"]+tag).strip()
-                all_questions.extend(qs)
-            except Exception as e:
-                print(f"  ⚠️ Chunk {a[3]+1} failed: {e}")
+        if len(batch_qs) < this_batch:
+            print("  ℹ️ API returned fewer than requested — stopping")
+            break
 
     return all_questions
 
 
-# ── Prompts ───────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# API DISPATCH
+# api_mode: "auto" | "gemini" | "groq" | "race"
+# ══════════════════════════════════════════════════════════════
 
-def _build_smart_prompt(content, filename, difficulties, lengths, total_q,
-                        lang, meta_ctx, qtype_instr, wants_summary):
-    bn_rule = ("Provide accurate Bangla translations for question_bn and answer_bn."
-               if lang != "english" else 'Set question_bn and answer_bn to "".')
-    en_rule = 'Set answer_en to "".' if lang == "bangla" else ""
-    per_diff = max(1, total_q // len(difficulties))
-    diff_lines = "\n".join(f"  • {d.capitalize()}: {per_diff} questions" for d in difficulties)
+def _call_api(gemini_key, groq_key, prompt_gemini, prompt_groq=None, api_mode="auto"):
+    """prompt_groq uses simpler schema that doesn't confuse Groq models."""
+    if prompt_groq is None:
+        prompt_groq = prompt_gemini  # fallback if caller passes one prompt
+    has_gemini = bool(gemini_key) and GEMINI_AVAILABLE
+    has_groq   = bool(groq_key)   and GROQ_AVAILABLE
 
-    summary_block = ""
-    if wants_summary:
-        summary_block = 'ALSO: Write a SHORT SUMMARY in <SUMMARY>...</SUMMARY> tags before the JSON.\n'
+    if not has_gemini and not has_groq:
+        raise RuntimeError("No API keys found. Add GEMINI_API_KEY or GROQ_API_KEY to your .env file.")
 
-    return f"""You are an expert bilingual educational content creator helping a student named Onna.
+    # Normalize: if user picks a mode but doesn't have that key, fall to auto
+    if api_mode == "gemini" and not has_gemini:
+        print("  ⚠️ Gemini-only mode but no Gemini key — switching to Groq")
+        api_mode = "groq"
+    if api_mode == "groq" and not has_groq:
+        print("  ⚠️ Groq-only mode but no Groq key — switching to Gemini")
+        api_mode = "gemini"
+    if api_mode == "race" and not (has_gemini and has_groq):
+        print("  ⚠️ Race mode needs both keys — switching to auto")
+        api_mode = "auto"
 
-Source: "{filename}"
+    # ── RACE: fire both in parallel, use first winner ─────────
+    if api_mode == "race":
+        return _race(gemini_key, groq_key, prompt_gemini, prompt_groq)
+
+    # ── GEMINI ONLY ───────────────────────────────────────────
+    if api_mode == "gemini":
+        return _try_gemini(gemini_key, prompt_gemini)
+
+    # ── GROQ ONLY ─────────────────────────────────────────────
+    if api_mode == "groq":
+        return _try_groq(groq_key, prompt_groq)
+
+    # ── AUTO: Gemini first → Groq fallback ────────────────────
+    if has_gemini:
+        try:
+            return _try_gemini(gemini_key, prompt_gemini)
+        except Exception as e:
+            print(f"  ⚠️ Gemini fully failed ({e}) — falling back to Groq")
+    if has_groq:
+        return _try_groq(groq_key, prompt_groq)
+
+    raise RuntimeError("Both Gemini and Groq failed. Check your API keys.")
+
+
+def _try_gemini(gemini_key, prompt):
+    """Try all Gemini models in order. Raises if all fail."""
+    for model in GEMINI_MODELS:
+        try:
+            print(f"    → Gemini/{model}")
+            raw = _gemini_call(gemini_key, model, prompt)
+            summary, raw = _extract_summary(raw)
+            questions = _sanitize_questions(_parse_json(raw))
+            for q in questions:
+                q["model_used"] = f"Gemini/{model}"
+            print(f"    ✅ Gemini/{model} → {len(questions)} Qs")
+            return questions, summary
+        except Exception as e:
+            msg = str(e)
+            if any(x in msg for x in ["429", "quota", "RESOURCE_EXHAUSTED", "rate"]):
+                print(f"    ⚠️ Gemini/{model} rate limited → next")
+                time.sleep(2)
+            elif any(x in msg for x in ["404", "NOT_FOUND", "not found"]):
+                print(f"    ⚠️ Gemini/{model} not found → next")
+            else:
+                print(f"    ⚠️ Gemini/{model}: {e} → next")
+    raise RuntimeError("All Gemini models failed. Rate limited or key invalid.")
+
+
+def _try_groq(groq_key, prompt):
+    """Try all Groq models in order. Raises if all fail."""
+    live = _get_groq_models(groq_key)
+    for model in live:
+        try:
+            print(f"    → Groq/{model}")
+            raw = _groq_call(groq_key, model, prompt)
+            summary, raw = _extract_summary(raw)
+            questions = _sanitize_questions(_parse_json(raw))
+            for q in questions:
+                q["model_used"] = f"Groq/{model}"
+            print(f"    ✅ Groq/{model} → {len(questions)} Qs")
+            return questions, summary
+        except Exception as e:
+            msg = str(e)
+            if any(x in msg for x in ["429", "rate_limit", "rate limit"]):
+                print(f"    ⚠️ Groq/{model} rate limited → next")
+                time.sleep(2)
+            elif any(x in msg for x in ["404", "not found", "model_not_found", "decommissioned"]):
+                print(f"    ⚠️ Groq/{model} not found → next")
+            else:
+                print(f"    ⚠️ Groq/{model}: {e} → next")
+    raise RuntimeError("All Groq models failed. Rate limited or key invalid.")
+
+
+def _race(gemini_key, groq_key, prompt_gemini, prompt_groq):
+    """Fire Gemini + Groq simultaneously. Return first valid result."""
+    import threading
+    result = {"winner": None, "errors": [], "lock": threading.Lock()}
+
+    def run(name, fn, key, prompt):
+        try:
+            qs, summary = fn(key, prompt)
+            with result["lock"]:
+                if result["winner"] is None and qs:
+                    result["winner"] = (qs, summary, name)
+                    print(f"  🏁 Race won by {name}!")
+        except Exception as e:
+            with result["lock"]:
+                result["errors"].append(f"{name}: {e}")
+            print(f"  ⚠️ {name} lost race: {e}")
+
+    threads = [
+        threading.Thread(target=run, args=("Gemini", _try_gemini, gemini_key, prompt_gemini), daemon=True),
+        threading.Thread(target=run, args=("Groq",   _try_groq,   groq_key,   prompt_groq),  daemon=True),
+    ]
+    for t in threads: t.start()
+
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        with result["lock"]:
+            if result["winner"]: break
+            if len(result["errors"]) >= 2: break
+        if not any(t.is_alive() for t in threads): break
+        time.sleep(0.2)
+
+    if result["winner"]:
+        qs, summary, name = result["winner"]
+        return qs, summary
+
+    err = " | ".join(result["errors"]) or "Timeout"
+    raise RuntimeError(f"Race failed — {err}")
+
+
+# ══════════════════════════════════════════════════════════════
+# GEMINI BACKEND
+# ══════════════════════════════════════════════════════════════
+
+def _gemini_call(api_key, model, prompt, retries=2):
+    client = genai.Client(api_key=api_key)
+    for attempt in range(retries):
+        try:
+            resp = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    temperature=0.7,
+                    max_output_tokens=8192,
+                ),
+            )
+            return resp.text
+        except Exception as e:
+            msg = str(e)
+            if any(x in msg for x in ["429", "quota", "RESOURCE_EXHAUSTED"]) and attempt < retries - 1:
+                wait = 10 + random.uniform(0, 3)
+                print(f"    ⏳ Gemini waiting {wait:.0f}s")
+                time.sleep(wait)
+            else:
+                raise
+
+
+# ══════════════════════════════════════════════════════════════
+# GROQ BACKEND
+# ══════════════════════════════════════════════════════════════
+
+def _get_groq_models(api_key):
+    try:
+        import requests as _req
+        r = _req.get(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=5,
+        )
+        if r.status_code == 200:
+            data = r.json().get("data", [])
+            skip = {"whisper", "guard", "tts", "safeguard", "vision"}
+            ids  = [
+                m["id"] for m in data
+                if m.get("active", True)
+                and not any(s in m["id"].lower() for s in skip)
+            ]
+            big   = [i for i in ids if any(x in i for x in ["70b", "120b", "32b", "scout", "maverick"])]
+            small = [i for i in ids if i not in big]
+            ordered = big + small
+            if ordered:
+                print(f"    🔍 Groq live models: {ordered[:3]}")
+                return ordered
+    except Exception as e:
+        print(f"    ⚠️ Could not fetch Groq model list: {e}")
+    return GROQ_MODELS
+
+
+def _groq_call(api_key, model, prompt, retries=2):
+    client  = Groq(api_key=api_key)
+    trimmed = prompt if len(prompt) <= 20000 else prompt[:20000] + "\n\n[Content trimmed. Generate questions from the above only.]"
+    for attempt in range(retries):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an educational question generator. "
+                            "You MUST respond with ONLY a valid JSON array. "
+                            "No prose, no markdown, no explanation — "
+                            "just the raw JSON array starting with [ and ending with ]."
+                        ),
+                    },
+                    {"role": "user", "content": trimmed},
+                ],
+                temperature=0.7,
+                max_tokens=6000,
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            msg = str(e)
+            if any(x in msg for x in ["429", "rate_limit", "rate limit"]) and attempt < retries - 1:
+                wait = 8 + random.uniform(0, 2)
+                print(f"    ⏳ Groq waiting {wait:.0f}s")
+                time.sleep(wait)
+            else:
+                raise
+
+
+# ══════════════════════════════════════════════════════════════
+# PROMPT BUILDER
+# ══════════════════════════════════════════════════════════════
+
+def _build_batch_prompt(
+    content, filename, difficulties, lengths, qtype_instr,
+    lang, meta_ctx, batch_size, id_start, page_from, page_to,
+    wants_summary, already_asked, for_groq=False,
+):
+    bn_rule = (
+        "Provide accurate Bangla for question_bn and answer_bn."
+        if lang != "english"
+        else 'Set question_bn and answer_bn to "".'
+    )
+    en_rule  = 'Set answer_en to "".' if lang == "bangla" else ""
+    diff_str = ", ".join(d.capitalize() for d in difficulties)
+    skip_block = ""
+    if already_asked:
+        shown = already_asked[:10]
+        skip_block = "Do NOT repeat these questions:\n" + "\n".join(f"  - {q}" for q in shown) + "\n\n"
+
+    summary_block = (
+        "Write a short file summary in <SUMMARY>...</SUMMARY> tags BEFORE the JSON array.\n\n"
+        if wants_summary else ""
+    )
+
+    # Groq models get a simpler schema — no HTML examples that confuse them
+    schema = """[
+  {{
+    "id": {id_start},
+    "question_en": "Write the question text here in plain English",
+    "question_bn": "Bengali translation here or empty string",
+    "difficulty": "easy",
+    "length": "short",
+    "important": false,
+    "answer_en": "Write the answer here in plain English",
+    "answer_bn": "Bengali translation of answer here or empty string",
+    "formula": null,
+    "topic": "Topic name",
+    "section_name": "Section heading from the content",
+    "search_keyword": "one keyword",
+    "where_to_find": "Page X, under Heading Y",
+    "question_type": "definition",
+    "page_references": ["Page {page_from}"]
+  }}
+]""".format(id_start=id_start, page_from=page_from)
+
+    return f"""You are generating study questions for a student named Onna.
+
+File: "{filename}" | Pages: {page_from}–{page_to}
 {meta_ctx}
 
 CONTENT:
 {content}
 
-{summary_block}
-
-TASK: Pick and generate the {total_q} MOST IMPORTANT questions from this content.
+{summary_block}{skip_block}Generate exactly {batch_size} questions from the CONTENT above.
+IDs must go from {id_start} to {id_start + batch_size - 1}.
 Question focus: {qtype_instr}
+Difficulty levels to include: {diff_str}
+Answer length: {", ".join(lengths)} (short=2-3 sentences, long=detailed paragraph)
+{bn_rule}
+{en_rule}
 
-Distribution across difficulties:
-{diff_lines}
-Lengths: distribute evenly between {", ".join(lengths)}
+CRITICAL RULES:
+1. Output ONLY a valid JSON array — nothing before or after it.
+2. Start with [ and end with ]. No markdown. No prose. No explanation.
+3. question_en and answer_en must contain PLAIN TEXT only — no HTML, no tags, no angle brackets.
+4. Every string value must be plain readable text.
 
-RULES:
-- Mark ALL as "important": true
-- {bn_rule}
-- {en_rule}
-- short = 2–3 sentence answer, long = detailed multi-paragraph
-- Include formula/equation in formula field when relevant
-- For EACH question, fill in these "find it" fields so Onna can locate it in her file:
-    • section_name    : the chapter/section heading this topic belongs to (e.g. "3.2 Entropy")
-    • search_keyword  : ONE short word or phrase Onna can Ctrl+F to find this in her file
-    • where_to_find   : plain English hint, e.g. "Page 12, under the heading Gibbs Free Energy"
-    • page_references : list of page numbers, e.g. ["Page 12", "Page 13"]
-
-Return a COMPLETE valid JSON array (after summary tags if any).
-No markdown. No truncation. Complete every object fully.
-
-[{{
-  "id": 1,
-  "question_en": "...",
-  "question_bn": "...",
-  "difficulty": "beginner|easy|intermediate|hard",
-  "length": "short|long",
-  "important": true,
-  "answer_en": "...",
-  "answer_bn": "...",
-  "formula": "...or null",
-  "topic": "topic name",
-  "section_name": "e.g. Chapter 3: Thermodynamics",
-  "search_keyword": "e.g. entropy",
-  "where_to_find": "e.g. Page 5, under heading Entropy",
-  "question_type": "definition|descriptive|formula|figure|mixed",
-  "page_references": ["Page 1"]
-}}]"""
+Follow this exact JSON structure:
+{schema}"""
 
 
-def _build_prompt(content, filename, difficulties, lengths, target_q, q_per_page,
-                  page_start, page_end, lang, meta_ctx, qtype_instr, wants_summary):
-    bn_rule = ("Provide accurate Bangla translations for question_bn and answer_bn."
-               if lang != "english" else 'Set question_bn and answer_bn to "".')
-    en_rule = 'Set answer_en to "".' if lang == "bangla" else ""
-    diff_lines = "\n".join(
-        f"  • {d.capitalize()}: {q_per_page} q/page × {max(1,page_end-page_start+1)} pages"
-        for d in difficulties)
-    summary_block = 'ALSO: Write a SHORT SUMMARY in <SUMMARY>...</SUMMARY> tags before the JSON.\n' \
-                    if wants_summary else ""
-
-    return f"""You are an expert bilingual educational content creator helping Onna study.
-
-Source: "{filename}" | Pages: {page_start}–{page_end}
-{meta_ctx}
-
-CONTENT:
-{content}
-
-{summary_block}
-
-TASK: Generate exactly {target_q} questions:
-{diff_lines}
-Question focus: {qtype_instr}
-Lengths: {", ".join(lengths)} (short=2-3 sentences, long=multi-paragraph)
-
-RULES:
-- Questions ONLY from this content
-- Mark ~20% as "important": true
-- Include formula/law in formula field when present
-- {bn_rule}
-- {en_rule}
-- For EACH question fill in "find it" fields:
-    • section_name   : heading/chapter this belongs to (e.g. "2.1 Ideal Gas Law")
-    • search_keyword : one short Ctrl+F keyword from the file
-    • where_to_find  : e.g. "Page 8, under Ideal Gas"
-    • page_references: e.g. ["Page 8"]
-
-Return COMPLETE valid JSON array. No markdown. No truncation.
-
-[{{
-  "id": 1,
-  "question_en": "...",
-  "question_bn": "...",
-  "difficulty": "beginner|easy|intermediate|hard",
-  "length": "short|long",
-  "important": false,
-  "answer_en": "...",
-  "answer_bn": "...",
-  "formula": "...or null",
-  "topic": "...",
-  "section_name": "...",
-  "search_keyword": "...",
-  "where_to_find": "...",
-  "question_type": "definition|descriptive|formula|figure|mixed",
-  "page_references": ["Page {page_start}"]
-}}]"""
-
+# ══════════════════════════════════════════════════════════════
+# SHARED HELPERS
+# ══════════════════════════════════════════════════════════════
 
 def _build_meta_context(metadata):
-    if not metadata: return ""
+    if not metadata:
+        return ""
     parts = []
     if metadata.get("formulas"):
-        parts.append("KEY FORMULAS:\n"+"\n".join(f"  • {f}" for f in metadata["formulas"][:10]))
+        parts.append("Key formulas: " + " | ".join(metadata["formulas"][:8]))
     if metadata.get("sections"):
-        parts.append("SECTIONS:\n"+"\n".join(f"  • {s}" for s in metadata["sections"][:8]))
+        parts.append("Sections: " + " | ".join(metadata["sections"][:6]))
     return "\n".join(parts)
 
 
-# ── API ───────────────────────────────────────────────────────────
-
-def _call_api(api_key, prompt, filename, chunk_idx, total_chunks):
-    client = genai.Client(api_key=api_key)
-    failed = set()
-    for model_name in AVAILABLE_MODELS:
-        if model_name in failed: continue
-        try:
-            print(f"  → {model_name} | chunk {chunk_idx+1}/{total_chunks}")
-            raw = _call_with_retry(client, model_name, prompt)
-
-            summary = None
-            m = re.search(r"<SUMMARY>(.*?)</SUMMARY>", raw, re.DOTALL)
-            if m:
-                summary = m.group(1).strip()
-                raw = raw.replace(m.group(0),"").strip()
-
-            questions = _parse_json(raw)
-            for q in questions:
-                q["model_used"] = model_name
-                if summary:
-                    q["_summary"] = summary
-                    summary = None
-            print(f"  ✅ {model_name} → {len(questions)} questions")
-            return questions
-
-        except Exception as e:
-            msg = str(e)
-            if any(x in msg for x in ["429","quota","RESOURCE_EXHAUSTED","rate"]):
-                print(f"  ⚠️ {model_name} rate limited → next"); failed.add(model_name); time.sleep(3)
-            elif any(x in msg for x in ["404","not found","NOT_FOUND"]):
-                print(f"  ⚠️ {model_name} not found → next"); failed.add(model_name)
-            else:
-                raise RuntimeError(f"Gemini error ({model_name}): {e}")
-    raise RuntimeError("All models failed. Wait 1 minute and try again.")
-
-
-def _call_with_retry(client, model_name, prompt, max_retries=2):
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model=model_name, contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.7, max_output_tokens=65535),
-            )
-            return response.text
-        except Exception as e:
-            msg = str(e)
-            if any(x in msg for x in ["429","quota","RESOURCE_EXHAUSTED"]) and attempt < max_retries-1:
-                wait = 10 + random.uniform(0,3)
-                m = re.search(r"retry[_\s]after[:\s]*([\d.]+)", msg, re.IGNORECASE)
-                if m: wait = float(m.group(1))+1
-                print(f"  ⏳ Waiting {wait:.0f}s"); time.sleep(wait)
-            else: raise
+def _extract_summary(raw):
+    m = re.search(r"<SUMMARY>(.*?)</SUMMARY>", raw, re.DOTALL)
+    if m:
+        return m.group(1).strip(), raw.replace(m.group(0), "").strip()
+    return None, raw
 
 
 def _parse_json(raw):
-    cleaned = re.sub(r"```(?:json)?","",raw).replace("```","").strip()
+    cleaned = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
+
+    # Direct parse
     try:
         r = json.loads(cleaned)
-        if isinstance(r,list): return r
-        if isinstance(r,dict):
+        if isinstance(r, list):
+            return r
+        if isinstance(r, dict):
             for v in r.values():
-                if isinstance(v,list): return v
-    except json.JSONDecodeError: pass
+                if isinstance(v, list) and v:
+                    return v
+    except json.JSONDecodeError:
+        pass
 
-    s = cleaned.find("["); e = cleaned.rfind("]")+1
+    # Find array by brackets
+    s = cleaned.find("[")
+    e = cleaned.rfind("]") + 1
     if s != -1 and e > s:
         try:
             r = json.loads(cleaned[s:e])
-            if isinstance(r,list): return r
-        except json.JSONDecodeError: pass
+            if isinstance(r, list):
+                return r
+        except json.JSONDecodeError:
+            pass
 
-    # Truncation recovery
-    print("  ⚠️  Truncated — recovering...")
-    if s == -1: raise ValueError(f"No JSON:\n{raw[:300]}")
+    # Object-by-object recovery for truncated output
+    print("  ⚠️ Full parse failed — recovering objects individually")
+    if s == -1:
+        raise ValueError(f"No JSON array found in response:\n{raw[:300]}")
     partial   = cleaned[s:]
     recovered = []
     depth, obj_start = 0, None
@@ -340,36 +502,42 @@ def _parse_json(raw):
         if ch == '"':
             i += 1
             while i < len(partial):
-                if partial[i]=='\\': i+=2; continue
-                if partial[i]=='"': break
+                if partial[i] == '\\':
+                    i += 2
+                    continue
+                if partial[i] == '"':
+                    break
                 i += 1
-        elif ch=='{':
-            if depth==0: obj_start=i
-            depth+=1
-        elif ch=='}':
-            depth-=1
-            if depth==0 and obj_start is not None:
+        elif ch == '{':
+            if depth == 0:
+                obj_start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and obj_start is not None:
                 try:
-                    obj=json.loads(partial[obj_start:i+1])
-                    if isinstance(obj,dict) and "question_en" in obj:
+                    obj = json.loads(partial[obj_start:i + 1])
+                    if isinstance(obj, dict) and "question_en" in obj:
                         recovered.append(obj)
-                except json.JSONDecodeError: pass
-                obj_start=None
-        i+=1
+                except json.JSONDecodeError:
+                    pass
+                obj_start = None
+        i += 1
 
     if recovered:
-        print(f"  ✅ Recovered {len(recovered)} questions"); return recovered
-    raise ValueError(f"Could not parse JSON:\n{raw[:400]}")
+        print(f"  ✅ Recovered {len(recovered)} questions")
+        return recovered
+    raise ValueError(f"Could not parse any JSON from response:\n{raw[:400]}")
 
 
-def _split_text(text, max_chars=MAX_CHARS_PER_CHUNK):
-    if len(text)<=max_chars: return [text]
-    chunks=[]
-    while text:
-        if len(text)<=max_chars: chunks.append(text); break
-        cut=text.rfind("\n\n",0,max_chars)
-        if cut==-1: cut=text.rfind("\n",0,max_chars)
-        if cut==-1: cut=text.rfind(". ",0,max_chars)
-        if cut==-1: cut=max_chars
-        chunks.append(text[:cut+1]); text=text[cut+1:].strip()
-    return chunks
+def _sanitize_questions(questions):
+    """Strip any HTML tags that leaked into question/answer text fields."""
+    html_tag = re.compile(r"<[^>]+>")
+    text_fields = ["question_en", "question_bn", "answer_en", "answer_bn",
+                   "topic", "section_name", "search_keyword", "where_to_find"]
+    for q in questions:
+        for field in text_fields:
+            val = q.get(field)
+            if isinstance(val, str) and "<" in val:
+                q[field] = html_tag.sub("", val).strip()
+    return questions

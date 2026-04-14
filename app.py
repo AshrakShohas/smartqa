@@ -6,7 +6,8 @@ from extractor import extract_text_from_file, get_page_count
 from qa_generator import generate_questions
 
 load_dotenv()
-API_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
+API_KEY      = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY",   os.getenv("GROQ_API_KEY",   ""))
 
 st.set_page_config(
     page_title="Onna's SmartQA ✨",
@@ -147,8 +148,46 @@ with st.sidebar:
       <div style='font-size:11px;color:#8868a8;margin-top:4px'>Made with love by Shohas 💕</div>
     </div>
     """, unsafe_allow_html=True)
-    if API_KEY: st.success("🔑 Ready!")
-    else:       st.error("🔑 API key missing in .env")
+    # ── Key status indicators ────────────────────────────
+    gemini_ok = bool(API_KEY)
+    groq_ok   = bool(GROQ_API_KEY)
+    if gemini_ok:
+        st.success("✅ Gemini key ready")
+    else:
+        st.warning("⚠️ No Gemini key")
+    if groq_ok:
+        st.success("✅ Groq key ready")
+    else:
+        st.warning("⚠️ No Groq key")
+
+    st.markdown("### 🤖 API Mode")
+    _mode_options = []
+    _mode_labels  = []
+    if gemini_ok and groq_ok:
+        _mode_options = ["auto", "gemini", "groq", "race"]
+        _mode_labels  = [
+            "🔄 Auto (Gemini → Groq fallback)",
+            "🔵 Gemini only",
+            "🟢 Groq only",
+            "🏁 Race (fastest wins)",
+        ]
+    elif gemini_ok:
+        _mode_options = ["gemini"]
+        _mode_labels  = ["🔵 Gemini only"]
+    elif groq_ok:
+        _mode_options = ["groq"]
+        _mode_labels  = ["🟢 Groq only"]
+    else:
+        _mode_options = ["auto"]
+        _mode_labels  = ["❌ No keys — add to .env"]
+
+    _selected_label = st.radio(
+        "Choose API",
+        options=_mode_labels,
+        label_visibility="collapsed",
+        help="Auto tries Gemini first and falls back to Groq if it fails. Race fires both at once.",
+    )
+    api_mode = _mode_options[_mode_labels.index(_selected_label)]
     st.divider()
 
     st.markdown("### 📊 Difficulty")
@@ -189,9 +228,9 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-if not API_KEY:
-    st.error("❌ Add `GEMINI_API_KEY=your_key` to your `.env` file.")
-    st.info("Free key at 👉 https://aistudio.google.com"); st.stop()
+if not API_KEY and not GROQ_API_KEY:
+    st.error("❌ Add `GEMINI_API_KEY` or `GROQ_API_KEY` (or both) to your `.env` file.")
+    st.info("Free Gemini key 👉 https://aistudio.google.com\nFree Groq key 👉 https://console.groq.com"); st.stop()
 
 
 # ── STEP 1: Upload ───────────────────────────────────────────
@@ -419,15 +458,30 @@ if uploaded_files and st.session_state.file_info:
 
         # Loading animation
         loading_ph = st.empty()
-        msgs = [
-            "Reading your study files with love... 📖",
-            "Finding the best questions for you... 🌟",
-            "Almost ready, Onna! ✨",
-            "Polishing your questions... 💜",
-            "Just a little more... 💕",
+        import random as _random
+        QUOTES = [
+            'The secret of getting ahead is getting started. -- Mark Twain',
+            'It always seems impossible until its done. -- Nelson Mandela',
+            'Do not watch the clock; do what it does. Keep going. -- Sam Levenson',
+            'You do not have to be great to start, but you have to start to be great.',
+            'The harder you work for something, the greater you feel when you achieve it.',
+            'Dream big. Start small. Act now.',
+            'Success is the sum of small efforts repeated day in and day out. -- R. Collier',
+            'Believe you can and you are halfway there. -- Theodore Roosevelt',
+            'Learning never exhausts the mind. -- Leonardo da Vinci',
+            'Education is the most powerful weapon you can use to change the world.',
+            'The beautiful thing about learning is that no one can take it away from you.',
+            'Push yourself, because no one else is going to do it for you.',
+            'Great things never come from comfort zones.',
+            'Study hard, for the well is deep and our brains are shallow.',
+            'The expert in anything was once a beginner. -- Helen Hayes',
         ]
+        _quotes_shuffled = _random.sample(QUOTES, len(QUOTES))
+        _quote_idx = [0]
 
         def show_loading(msg_idx=0, fname=""):
+            quote = _quotes_shuffled[_quote_idx[0] % len(_quotes_shuffled)]
+            _quote_idx[0] += 1
             loading_ph.markdown(f"""
             <div class="loading-overlay">
               <div class="sparkles">✨ 💜 ✨</div>
@@ -435,7 +489,7 @@ if uploaded_files and st.session_state.file_info:
               <div class="loading-title">Crafting your questions!</div>
               <div class="loading-sub">Onna, this will just take a moment 💕</div>
               <div class="loading-bar-wrap"><div class="loading-bar"></div></div>
-              <div class="loading-msg">{msgs[msg_idx % len(msgs)]}</div>
+              <div class="loading-msg" style="font-size:14px;color:#d0b8f8;font-style:italic;max-width:480px;text-align:center;line-height:1.6;padding:0 20px">{quote}</div>
             </div>
             """, unsafe_allow_html=True)
 
@@ -467,7 +521,21 @@ if uploaded_files and st.session_state.file_info:
                         for fm in metadata["formulas"][:15]:
                             st.code(fm, language=None)
 
-                status.markdown(f"🤖 Generating for **{fname}**...")
+                batch_counter = [0]
+                batch_placeholder = st.empty()
+
+                def on_batch(batch_qs, summary=None):
+                    batch_counter[0] += len(batch_qs)
+                    batch_placeholder.info(
+                        f"⚡ **{fname}** — {batch_counter[0]} questions generated so far..."
+                    )
+                    if summary and fname not in all_summaries:
+                        all_summaries[fname] = summary
+                    if batch_qs and batch_qs[0].get("model_used") and not st.session_state.model_used:
+                        st.session_state.model_used = batch_qs[0]["model_used"]
+
+                mode_label = {'auto':'🔄 Auto','gemini':'🔵 Gemini','groq':'🟢 Groq','race':'🏁 Race'}.get(api_mode, api_mode)
+                status.markdown(f"{mode_label} Generating for **{fname}** (batches of 10)...")
 
                 qs = generate_questions(
                     text=text, filename=fname, api_key=API_KEY,
@@ -479,21 +547,20 @@ if uploaded_files and st.session_state.file_info:
                     smart_total=cfg.get("smart_total",50),
                     question_type=qtype_key,
                     wants_summary=wants_summary,
+                    groq_api_key=GROQ_API_KEY,
+                    api_mode=api_mode,
+                    on_batch=on_batch,
                 )
 
-                # Pull summary out
-                for q in qs:
-                    if q.get("_summary") and fname not in all_summaries:
-                        all_summaries[fname] = q.pop("_summary")
-
-                if qs and qs[0].get("model_used"):
-                    st.session_state.model_used = qs[0]["model_used"]
-
+                batch_placeholder.empty()
                 all_questions.extend(qs)
                 st.success(f"✅ **{fname}** → {len(qs)} questions")
 
             except Exception as e:
-                st.warning(f"⚠️ {fname}: {e}")
+                st.error(f"❌ **{fname}** failed: {e}")
+                import traceback
+                with st.expander("🔍 Full error details"):
+                    st.code(traceback.format_exc())
 
             bar.progress(int((idx+1)/len(uploaded_files)*100))
 
