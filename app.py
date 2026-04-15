@@ -6,8 +6,17 @@ from extractor import extract_text_from_file, get_page_count
 from qa_generator import generate_questions
 
 load_dotenv()
-API_KEY      = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
-GROQ_API_KEY = st.secrets.get("GROQ_API_KEY",   os.getenv("GROQ_API_KEY",   ""))
+def _get_secret(key):
+    """Read from st.secrets (Streamlit Cloud) or .env file, safely."""
+    try:
+        val = st.secrets.get(key, "")
+        if val: return val
+    except Exception:
+        pass
+    return os.getenv(key, "")
+
+API_KEY      = _get_secret("GEMINI_API_KEY")
+GROQ_API_KEY = _get_secret("GROQ_API_KEY")
 
 st.set_page_config(
     page_title="Onna's SmartQA ✨",
@@ -521,13 +530,17 @@ if uploaded_files and st.session_state.file_info:
                         for fm in metadata["formulas"][:15]:
                             st.code(fm, language=None)
 
+                import threading as _threading
                 batch_counter = [0]
+                batch_lock    = _threading.Lock()
                 batch_placeholder = st.empty()
 
                 def on_batch(batch_qs, summary=None):
-                    batch_counter[0] += len(batch_qs)
+                    with batch_lock:
+                        batch_counter[0] += len(batch_qs)
+                        count = batch_counter[0]
                     batch_placeholder.info(
-                        f"⚡ **{fname}** — {batch_counter[0]} questions generated so far..."
+                        f"⚡ **{fname}** — {count} questions ready so far..."
                     )
                     if summary and fname not in all_summaries:
                         all_summaries[fname] = summary

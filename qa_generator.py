@@ -72,9 +72,19 @@ def generate_questions(
     question_type="mixed", wants_summary=False,
     groq_api_key=None,
     race_mode=False,   # kept for API compat
-    api_mode="auto",   # "auto"=Gemini first→Groq fallback | "gemini"=Gemini only | "groq"=Groq only | "race"=parallel fastest wins
-    on_batch=None,     # callback(batch_questions, summary_or_None) for progressive UI
+    api_mode="auto",   # "auto" | "gemini" | "groq" | "race"
+    on_batch=None,     # callback(batch_questions, summary_or_None) called as each batch completes
 ):
+    """
+    SPEED STRATEGY:
+    - Split total questions into BATCH_SIZE chunks
+    - Fire ALL chunks in parallel using ThreadPoolExecutor
+    - Each finished batch is immediately sent to on_batch() so UI updates live
+    - Total time ≈ time of ONE API call, not N sequential calls
+    """
+    import threading
+    import concurrent.futures
+
     meta_ctx    = _build_meta_context(metadata)
     qtype_instr = QTYPE_INSTRUCTIONS.get(question_type, QTYPE_INSTRUCTIONS["mixed"])
     content     = text[:MAX_CHARS_BATCH]
@@ -86,22 +96,20 @@ def generate_questions(
         n_diff = max(1, len(difficulties))
         total_needed = min(pages * q_per_page * n_diff, 120)
 
-    all_questions    = []
-    generated        = 0
-    batch_num        = 0
-
+    # ── Build all batch prompts upfront ──────────────────────
+    batches = []   # list of (batch_num, id_start, prompt_gemini, prompt_groq)
+    generated = 0
+    batch_num = 0
     while generated < total_needed:
         this_batch = min(BATCH_SIZE, total_needed - generated)
         batch_num += 1
         id_start   = generated + 1
-
-        # Build two versions of the prompt - Groq needs simpler schema
         prompt_gemini = _build_batch_prompt(
             content=content, filename=filename, difficulties=difficulties,
             lengths=lengths, qtype_instr=qtype_instr, lang=lang, meta_ctx=meta_ctx,
             batch_size=this_batch, id_start=id_start, page_from=page_from,
             page_to=page_to, wants_summary=(wants_summary and batch_num == 1),
-            already_asked=[q.get("question_en", "") for q in all_questions],
+            already_asked=[],   # parallel batches can't know each other's Qs upfront
             for_groq=False,
         )
         prompt_groq = _build_batch_prompt(
@@ -109,33 +117,46 @@ def generate_questions(
             lengths=lengths, qtype_instr=qtype_instr, lang=lang, meta_ctx=meta_ctx,
             batch_size=this_batch, id_start=id_start, page_from=page_from,
             page_to=page_to, wants_summary=(wants_summary and batch_num == 1),
-            already_asked=[q.get("question_en", "") for q in all_questions],
+            already_asked=[],
             for_groq=True,
         )
+        batches.append((batch_num, id_start, this_batch, prompt_gemini, prompt_groq))
+        generated += this_batch
 
-        print(f"  📦 Batch {batch_num}: asking for {this_batch} questions (IDs {id_start}–{id_start+this_batch-1})")
+    print(f"  🚀 Firing {len(batches)} batches in PARALLEL (total ~{total_needed} questions)")
 
+    # ── Thread-safe accumulator ───────────────────────────────
+    results_lock  = threading.Lock()
+    all_questions = []
+    first_summary = [None]
+
+    def run_batch(args):
+        bnum, id_start, bsize, pg, pgr = args
+        print(f"    📦 Batch {bnum} starting (IDs {id_start}–{id_start+bsize-1})")
         try:
-            batch_qs, summary = _call_api(api_key, groq_api_key, prompt_gemini, prompt_groq, api_mode=api_mode)
+            qs, summary = _call_api(api_key, groq_api_key, pg, pgr, api_mode=api_mode)
+            for q in qs:
+                q["source_file"] = filename
+            with results_lock:
+                all_questions.extend(qs)
+                if summary and first_summary[0] is None:
+                    first_summary[0] = summary
+            print(f"    ✅ Batch {bnum} done → {len(qs)} questions")
+            if on_batch and qs:
+                on_batch(qs, summary if bnum == 1 else None)
+            return len(qs)
         except Exception as e:
-            print(f"  ❌ Batch {batch_num} failed: {e}")
-            break  # return whatever we have so far
+            print(f"    ❌ Batch {bnum} failed: {e}")
+            return 0
 
-        for q in batch_qs:
-            q["source_file"] = filename
+    # ── Run all batches in parallel ───────────────────────────
+    # Max workers: cap at 5 to avoid rate limits, min with number of batches
+    max_workers = min(5, len(batches))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(run_batch, b) for b in batches]
+        concurrent.futures.wait(futures)
 
-        all_questions.extend(batch_qs)
-        generated += len(batch_qs)
-
-        if on_batch and batch_qs:
-            on_batch(batch_qs, summary if batch_num == 1 else None)
-
-        print(f"  ✅ Batch {batch_num} → {len(batch_qs)} questions | Running total: {generated}/{total_needed}")
-
-        if len(batch_qs) < this_batch:
-            print("  ℹ️ API returned fewer than requested — stopping")
-            break
-
+    print(f"  🎉 All batches done. Total: {len(all_questions)} questions")
     return all_questions
 
 
@@ -347,9 +368,13 @@ def _groq_call(api_key, model, prompt, retries=2):
                         "role": "system",
                         "content": (
                             "You are an educational question generator. "
-                            "You MUST respond with ONLY a valid JSON array. "
-                            "No prose, no markdown, no explanation — "
-                            "just the raw JSON array starting with [ and ending with ]."
+                            "STRICT OUTPUT RULES:\n"
+                            "1. Respond with ONLY a raw JSON array — nothing else.\n"
+                            "2. Start your response with [ and end with ].\n"
+                            "3. No markdown, no code fences, no prose, no explanation.\n"
+                            "4. ALL string values must be plain readable text — "
+                            "NEVER put HTML, XML, or any angle-bracket tags inside JSON string values.\n"
+                            "5. question_en must be a real study question in plain English."
                         ),
                     },
                     {"role": "user", "content": trimmed},
@@ -531,13 +556,39 @@ def _parse_json(raw):
 
 
 def _sanitize_questions(questions):
-    """Strip any HTML tags that leaked into question/answer text fields."""
-    html_tag = re.compile(r"<[^>]+>")
-    text_fields = ["question_en", "question_bn", "answer_en", "answer_bn",
-                   "topic", "section_name", "search_keyword", "where_to_find"]
+    """
+    Clean up questions from Groq/Gemini:
+    - Strip HTML tags from all text fields
+    - Reject questions where question_en looks like HTML (bad generation)
+    - Ensure question_en is a real question, not metadata/code
+    """
+    html_tag     = re.compile(r"<[^>]+>")
+    html_pattern = re.compile(r"<(div|span|p|br|html|body|style|script)[\s>]", re.IGNORECASE)
+    text_fields  = ["question_en", "question_bn", "answer_en", "answer_bn",
+                    "topic", "section_name", "search_keyword", "where_to_find"]
+    clean = []
     for q in questions:
+        q_en = q.get("question_en", "")
+
+        # Reject if question_en is clearly HTML garbage
+        if html_pattern.search(q_en):
+            print(f"  🗑️ Rejected bad question (HTML in question_en): {q_en[:60]}")
+            continue
+
+        # Reject if question_en is empty or too short after stripping
+        q_en_stripped = html_tag.sub("", q_en).strip()
+        if len(q_en_stripped) < 10:
+            print(f"  🗑️ Rejected empty/short question_en: {repr(q_en[:60])}")
+            continue
+
+        # Strip HTML from all text fields
         for field in text_fields:
             val = q.get(field)
             if isinstance(val, str) and "<" in val:
                 q[field] = html_tag.sub("", val).strip()
-    return questions
+
+        clean.append(q)
+
+    if len(clean) < len(questions):
+        print(f"  ⚠️ Sanitizer removed {len(questions)-len(clean)} malformed questions")
+    return clean
